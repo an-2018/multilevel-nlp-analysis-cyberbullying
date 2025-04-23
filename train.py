@@ -1,0 +1,87 @@
+import argparse
+import logging
+import mlflow
+import mlflow.sklearn
+from mlflow import trace
+from sklearn.base import BaseEstimator, RegressorMixin
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.metrics import mean_squared_error, r2_score
+from sklearn.datasets import fetch_california_housing
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+mlflow.set_tracking_uri("https://multimodal-fusion-mlflow-compose.tqq5a5.easypanel.host")
+mlflow.set_experiment("california_house_price_prediction")
+
+NUM_EPOCHS = 2
+class LoggingCallback(BaseEstimator, RegressorMixin):
+    def __init__(self, model):
+        self.model = model
+        self.mse_list = []
+        self.r2_list = []
+
+    @mlflow.trace
+    def fit(self, X, y):
+        for i in range(1, NUM_EPOCHS + 1):  # Simulate 10 epochs
+            self.model.fit(X, y)
+            preds = self.model.predict(X)
+            mse = mean_squared_error(y, preds)
+            r2 = r2_score(y, preds)
+            self.mse_list.append(mse)
+            self.r2_list.append(r2)
+            logging.info(f"Epoch {i}: MSE={mse}, R2={r2}")
+            mlflow.log_metrics({"mse": mse, "r2": r2}, step=i)
+
+        return self
+
+    @mlflow.trace
+    def predict(self, X):
+        return self.model.predict(X)
+
+@mlflow.trace
+def train(model_name):
+    with mlflow.start_run(run_name=model_name):
+        logging.info("Fetching California housing data")
+        california = fetch_california_housing()
+        X_train, X_test, y_train, y_test = train_test_split(
+            california.data, california.target, test_size=0.2, random_state=42
+        )
+
+        if model_name == "RandomForest":
+            param_grid = {
+                'n_estimators': [100],
+                'max_depth': [5],
+                'min_samples_split': [2, 5]
+            }
+            model = GridSearchCV(RandomForestRegressor(), param_grid, cv=3, n_jobs=-1)
+        elif model_name == "GradientBoosting":
+            param_grid = {
+                'n_estimators': [100],
+                'max_depth': [3],
+                'learning_rate': [0.01, 0.1]
+            }
+            model = GridSearchCV(GradientBoostingRegressor(), param_grid, cv=3, n_jobs=-1)
+
+        logging.info(f"Training model: {model_name}")
+        logging_model = LoggingCallback(model)
+        logging_model.fit(X_train, y_train)
+        best_model = logging_model.model.best_estimator_
+        preds = best_model.predict(X_test)
+        mse = mean_squared_error(y_test, preds)
+        r2 = r2_score(y_test, preds)
+
+        logging.info(f"Final MSE: {mse}, R2: {r2}")
+        mlflow.log_param("model", model_name)
+        mlflow.log_params(model.best_params_)
+        mlflow.log_metric("mse", mse)
+        mlflow.log_metric("r2", r2)
+
+        input_example = X_test[:5]
+        mlflow.sklearn.log_model(best_model, "model", input_example=input_example)
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model_name", type=str, required=True)
+    args = parser.parse_args()
+    train(args.model_name)
