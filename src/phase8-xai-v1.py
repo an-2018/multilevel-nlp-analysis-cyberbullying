@@ -173,13 +173,21 @@ class XAIAnalyzer:
         """Generate comprehensive XAI report"""
         report = []
 
+
         for model_name, explanations in self.explanations.items():
-            model_report = {
-                'model': model_name,
-                'top_features': {},
-                'category_impacts': self._aggregate_by_category(
-                    np.mean(np.abs(explanations.get('shap', [])), axis=0)
-            }
+            model_report = {}
+            model_report['model'] = model_name
+            model_report['top_features'] = {}
+            if 'shap' in explanations:
+                shap_values = np.mean(np.abs(explanations['shap']), axis=0)
+                top_features = np.argsort(shap_values)[-10:]
+                model_report['top_features'] = {self.data.columns[i]: shap_values[i] for i in top_features}
+                model_report['category_impacts'] = self._aggregate_by_category(shap_values)
+            else:
+                model_report['top_features'] = {self.data.columns[i]: 0 for i in range(len(self.data.columns))}
+                model_report['category_impacts'] = self._aggregate_by_category(np.zeros(len(self.data.columns)))
+            if 'ig' in explanations:
+                model_report['ig_top_features'] = {self.data.columns[i]: np.mean(np.abs(explanations['ig'][:, i])) for i in range(len(self.data.columns))}
 
             if 'lime' in explanations:
                 model_report['lime_top_features'] = self._process_lime_explanations(explanations['lime'])
