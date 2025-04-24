@@ -30,6 +30,19 @@ from tensorflow.keras.optimizers import Adam
 from scipy.sparse import load_npz
 from xgboost import XGBClassifier
 
+import tensorflow as tf
+
+gpus = tf.config.experimental.list_physical_devices('GPU')
+if gpus:
+    try:
+        tf.config.experimental.set_virtual_device_configuration(
+            gpus[0],
+            [tf.config.experimental.VirtualDeviceConfiguration(memory_limit=16096)]  # Memory in MB
+        )
+        print("✅ Limited GPU 0 to 4GB.")
+    except RuntimeError as e:
+        print("❌ Error setting virtual device config:", e)
+
 # --- Constants ---
 N_SPLITS = 5 # Number of folds for cross-validation on the training set
 RANDOM_STATE = 42

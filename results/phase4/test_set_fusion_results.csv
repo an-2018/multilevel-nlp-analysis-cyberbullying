@@ -1,0 +1,6 @@
+strategy,test_accuracy,test_precision,test_recall,test_f1_score
+Early (TFIDF_Dense+Lex+Syn -> SVM),0.7124463519313304,0.7619047619047619,0.6180257510729614,0.6824644549763034
+Intermediate (Sem+Syn -> BiLSTM),,,,
+Late Fusion (Avg Prob),,,,
+Baseline (TF-IDF Sparse -> SVM),0.5236051502145923,0.5325443786982249,0.38626609442060084,0.44776119402985076
+Baseline (Semantic -> Dense NN),,,,
