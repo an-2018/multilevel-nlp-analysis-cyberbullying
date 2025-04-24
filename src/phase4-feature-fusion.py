@@ -1,3 +1,4 @@
+import joblib
 import numpy as np
 import pandas as pd
 import sys
@@ -13,49 +14,45 @@ from sklearn.model_selection import StratifiedKFold, train_test_split
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support, classification_report
 from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.svm import SVC, LinearSVC
-from sklearn.linear_model import LogisticRegression # Added for potential calibration
+from sklearn.linear_model import LogisticRegression
 from sklearn.calibration import CalibratedClassifierCV
 
 # TensorFlow/Keras imports
 import os
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2' # Reduce TensorFlow verbosity
 import tensorflow as tf
-from tensorflow.keras.models import Model, Sequential
+from tensorflow.keras.models import Model, Sequential, load_model
 from tensorflow.keras.layers import Input, Dense, LSTM, Conv1D, GlobalMaxPooling1D, Dropout, Bidirectional, concatenate, Embedding
 from tensorflow.keras.callbacks import EarlyStopping
 from tensorflow.keras.optimizers import Adam
 
 # --- Constants ---
-N_SPLITS = 5
+N_SPLITS = 5 # Number of folds for cross-validation on the training set
 RANDOM_STATE = 42
 SEMANTIC_DIM = 384 # Dimension of 'all-MiniLM-L6-v2' embeddings
 EPOCHS = 50 # Max epochs for Keras models
 BATCH_SIZE = 32
 PATIENCE = 5 # Early stopping patience
+TEST_SET_SIZE = 0.2 # Proportion of data to hold out for the final test set
 
-# --- Model Building Functions (Adapted/Added from Phase 3) ---
+# --- Model Building Functions (Keep as before) ---
 
 def build_svm(kernel='linear', probability=False, class_weight='balanced', random_state=None):
     """Builds a Support Vector Classifier."""
     if kernel == 'linear':
-        # LinearSVC is often faster for high-dimensional sparse data like TF-IDF
-        # Use CalibratedClassifierCV to get probabilities if needed for late fusion
         base_svm = LinearSVC(
             class_weight=class_weight,
-            dual='auto', # Let sklearn choose based on n_samples/n_features
+            dual='auto',
             random_state=random_state,
             max_iter=5000,
             C=1.0,
             tol=1e-3
         )
         if probability:
-            # Use CalibratedClassifierCV for probability estimates with LinearSVC
-            # 'isotonic' often works well but requires more data; 'sigmoid' is faster
-            return CalibratedClassifierCV(base_svm, method='sigmoid', cv=3) # Use 3-fold internal CV for calibration
+            return CalibratedClassifierCV(base_svm, method='sigmoid', cv=3)
         else:
             return base_svm
     else:
-        # For non-linear kernels (like RBF), use SVC directly
         return SVC(kernel=kernel, probability=probability, class_weight=class_weight, random_state=random_state)
 
 
@@ -76,46 +73,34 @@ def build_dense_for_semantic(input_dim):
 
 def build_bilstm_intermediate(semantic_dim, syntactic_dim):
     """Builds a Bi-LSTM model for intermediate fusion of semantic and syntactic features."""
-    # Input layers
     semantic_input = Input(shape=(semantic_dim,), name='semantic_input')
     syntactic_input = Input(shape=(syntactic_dim,), name='syntactic_input')
-
-    # Process semantic input (assuming it's a flat vector, reshape for LSTM)
-    # If semantic_dim is large, consider a Dense layer first for dimensionality reduction
-    # Reshape semantic input to be suitable for LSTM (e.g., treat as a sequence of 1 step)
     semantic_reshaped = tf.keras.layers.Reshape((1, semantic_dim))(semantic_input)
-    lstm_out = Bidirectional(LSTM(64, return_sequences=False))(semantic_reshaped) # Or adjust units
-
-    # Concatenate LSTM output with syntactic features
+    lstm_out = Bidirectional(LSTM(64, return_sequences=False))(semantic_reshaped)
     combined = concatenate([lstm_out, syntactic_input])
-
-    # Dense layers for classification
     x = Dense(128, activation='relu')(combined)
     x = Dropout(0.5)(x)
     x = Dense(64, activation='relu')(x)
     x = Dropout(0.5)(x)
     output = Dense(1, activation='sigmoid')(x)
-
     model = Model(inputs=[semantic_input, syntactic_input], outputs=output, name="BiLSTM_Intermediate_Fusion")
     model.compile(optimizer=Adam(learning_rate=0.0005),
                   loss='binary_crossentropy',
                   metrics=['accuracy'])
     return model
 
-# --- Data Loading and Preprocessing (Adapted from Phase 3) ---
+# --- Data Loading and Preprocessing (Keep as before) ---
 
 def safe_literal_eval(x):
     """Safely evaluates a string literal, returning an empty list on error."""
     try:
-        # Ensure it's a string before attempting eval
         if isinstance(x, str):
             val = ast.literal_eval(x)
-            # Ensure it's a list or tuple before converting to numpy array
             if isinstance(val, (list, tuple)):
-                return np.array(val, dtype=np.float32) # Specify dtype for consistency
-        return np.array([], dtype=np.float32) # Return empty array of correct type
+                return np.array(val, dtype=np.float32)
+        return np.array([], dtype=np.float32)
     except (ValueError, SyntaxError, TypeError):
-        return np.array([], dtype=np.float32) # Return empty array on error
+        return np.array([], dtype=np.float32)
 
 def load_and_preprocess_data(file_path: Path, tfidf_sparse_path: Path):
     """Loads data, parses vectors, encodes labels, and handles missing columns."""
@@ -141,38 +126,28 @@ def load_and_preprocess_data(file_path: Path, tfidf_sparse_path: Path):
     if 'semantic_vector' in df.columns:
         print("Parsing semantic vectors...")
         df['semantic_vector'] = df['semantic_vector'].apply(safe_literal_eval)
-
-        # Check for empty arrays resulting from parsing errors or empty text
         empty_vectors = df['semantic_vector'].apply(lambda x: x.size == 0)
         if empty_vectors.any():
-            print(f"Warning: Found {empty_vectors.sum()} rows with invalid/empty semantic vectors. These rows might cause issues or be dropped.")
-            # Option 1: Fill with zeros (might skew results)
-            # df.loc[empty_vectors, 'semantic_vector'] = df.loc[empty_vectors, 'semantic_vector'].apply(lambda x: np.zeros(SEMANTIC_DIM))
-            # Option 2: Drop rows (safer if only a few)
             print(f"Dropping {empty_vectors.sum()} rows with invalid semantic vectors.")
-            df = df[~empty_vectors].copy() # Use .copy() to avoid SettingWithCopyWarning
+            df = df[~empty_vectors].copy()
             df.reset_index(drop=True, inplace=True)
             if df.empty:
                 print("Error: DataFrame is empty after removing rows with invalid semantic vectors.")
                 sys.exit(1)
-
-        # Verify the dimension of the first valid vector
         if not df.empty:
             first_valid_vector_dim = df['semantic_vector'].iloc[0].shape[0]
+            # Use the actual dimension found in the data if it differs from the constant
+            global SEMANTIC_DIM # Allow modification of the global constant
             if first_valid_vector_dim != SEMANTIC_DIM:
                 print(f"Warning: Expected semantic vector dimension {SEMANTIC_DIM}, but found {first_valid_vector_dim}. Using actual dimension: {first_valid_vector_dim}")
-                # Update SEMANTIC_DIM globally if you want to use the detected dimension
-                # global SEMANTIC_DIM
-                # SEMANTIC_DIM = first_valid_vector_dim
-            # Check consistency across all vectors
-            inconsistent_dims = df['semantic_vector'].apply(lambda x: x.shape[0] != first_valid_vector_dim).sum()
+                SEMANTIC_DIM = first_valid_vector_dim # Update global constant
+            inconsistent_dims = df['semantic_vector'].apply(lambda x: x.shape[0] != SEMANTIC_DIM).sum()
             if inconsistent_dims > 0:
-                print(f"Error: Found {inconsistent_dims} semantic vectors with inconsistent dimensions. Please check data generation.")
+                print(f"Error: Found {inconsistent_dims} semantic vectors with inconsistent dimensions.")
                 sys.exit(1)
     else:
-        print("Error: 'semantic_vector' column not found. Required for semantic and fusion models.")
+        print("Error: 'semantic_vector' column not found.")
         sys.exit(1)
-
 
     # 3. Encode 'label' column
     print("Encoding labels...")
@@ -181,129 +156,100 @@ def load_and_preprocess_data(file_path: Path, tfidf_sparse_path: Path):
     print(f"Labels mapped: {dict(zip(le.classes_, le.transform(le.classes_)))}")
     label_classes = le.classes_
 
-    # 4. Handle potentially missing 'profanity_score' and other lexical features
-    lexical_cols = ['word_count', 'unique_word_ratio', 'profanity_score'] # Add others if needed
+    # 4. Handle Lexical Features
+    lexical_cols = ['word_count', 'unique_word_ratio', 'profanity_score']
     for col in lexical_cols:
         if col not in df.columns:
             print(f"Warning: '{col}' column not found. Setting to 0.0.")
             df[col] = 0.0
         else:
-            # Ensure numeric and handle NaNs
-            df[col] = pd.to_numeric(df[col], errors='coerce')
-            if df[col].isnull().any():
-                print(f"Warning: Column {col} contained non-numeric values converted to NaN. Filling with 0.")
-                df[col].fillna(0, inplace=True)
+            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
 
-    # 5. Handle Syntactic Features (POS tags)
+    # 5. Handle Syntactic Features
     syntactic_cols = [col for col in df.columns if col.startswith('pos_')]
-    if not syntactic_cols:
-        print("Warning: No syntactic (POS) columns found. Intermediate fusion might be affected.")
-    else:
+    if syntactic_cols:
         print(f"Found {len(syntactic_cols)} syntactic columns.")
         for col in syntactic_cols:
-            if not pd.api.types.is_numeric_dtype(df[col]):
-                try:
-                    df[col] = pd.to_numeric(df[col], errors='coerce')
-                    if df[col].isnull().any():
-                        print(f"Warning: Column {col} contained non-numeric values converted to NaN. Filling with 0.")
-                        df[col].fillna(0, inplace=True)
-                except Exception as e:
-                    print(f"Error converting column {col} to numeric: {e}. Check data quality.")
-                    # Decide how to handle: drop column, exit, etc.
-                    # df = df.drop(columns=[col])
-                    # sys.exit(1)
+            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+    else:
+        print("Warning: No syntactic (POS) columns found.")
 
-    # 6. Handle TF-IDF features (check for dense columns, assume sparse is separate)
+    # 6. Handle TF-IDF features
     tfidf_sparse_matrix = None
     if not tfidf_sparse_path.exists():
-        print(f"Warning: Sparse TF-IDF matrix file not found at {tfidf_sparse_path}. 'tfidf_sparse' dependent models will be skipped.")
+        print(f"Warning: Sparse TF-IDF matrix file not found at {tfidf_sparse_path}.")
     else:
         try:
             tfidf_sparse_matrix = load_npz(tfidf_sparse_path)
             print(f"Loaded sparse TF-IDF matrix with shape: {tfidf_sparse_matrix.shape}")
             if tfidf_sparse_matrix.shape[0] != len(df):
-                print(f"Error: Row count mismatch between loaded data ({len(df)}) and sparse TF-IDF matrix ({tfidf_sparse_matrix.shape[0]}). Ensure they correspond.")
-                sys.exit(1)
+                print(f"Error: Row count mismatch between data ({len(df)}) and sparse TF-IDF ({tfidf_sparse_matrix.shape[0]}).")
+                # Attempt to reconcile if possible, otherwise exit
+                # Example: Filter df to match tfidf_sparse_matrix indices if df is larger
+                # Or reload data ensuring consistency
+                sys.exit(1) # Exit for now, requires careful handling
         except Exception as e:
             print(f"Error loading sparse TF-IDF matrix: {e}")
-            tfidf_sparse_matrix = None # Ensure it's None if loading fails
 
     tfidf_cols_dense = [col for col in df.columns if col.startswith('tfidf_')]
-    if not tfidf_cols_dense:
-        print("Warning: No dense TF-IDF columns (starting with 'tfidf_') found. 'tfidf_dense' group will be skipped if used.")
-    else:
-        print(f"Found {len(tfidf_cols_dense)} dense TF-IDF columns ('tfidf_*'). Converting to numeric.")
+    if tfidf_cols_dense:
+        print(f"Found {len(tfidf_cols_dense)} dense TF-IDF columns.")
         for col in tfidf_cols_dense:
-            if not pd.api.types.is_numeric_dtype(df[col]):
-                try:
-                    df[col] = pd.to_numeric(df[col], errors='coerce')
-                    if df[col].isnull().any():
-                        print(f"Warning: Column {col} contained non-numeric values converted to NaN. Filling with 0.")
-                        df[col].fillna(0, inplace=True)
-                except Exception as e:
-                    print(f"Error converting column {col} to numeric: {e}. Check data quality.")
-                    # sys.exit(1) # Or handle differently
+            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+    else:
+        print("Warning: No dense TF-IDF columns found.")
 
-    # Remove potentially problematic list-based tfidf columns from previous runs if they exist
-    for col_name in ['tfidf', 'tfidf_feature']: # Adjust if your column names differ
+    # Remove potentially problematic list-based tfidf columns
+    for col_name in ['tfidf', 'tfidf_feature']:
         if col_name in df.columns:
-            print(f"Removing potentially problematic column '{col_name}'.")
             df = df.drop(columns=[col_name])
 
-    # Final check for NaNs in critical columns
     df.dropna(subset=['clean_text', 'label_encoded'], inplace=True)
-    print(f"Data shape after final processing and NaN drop: {df.shape}")
+    print(f"Data shape after final processing: {df.shape}")
 
     return df, tfidf_sparse_matrix, label_classes
 
-# --- Feature Preparation Helper ---
+# --- Feature Preparation Helper (Keep as before) ---
 
 def prepare_features(df, feature_cols, scaler=None, fit_scaler=False, is_sparse=False):
     """Extracts, handles NaNs, and optionally scales features."""
     if is_sparse:
-        # For sparse data, we assume it's already prepared (like loaded from .npz)
-        # We just return it directly. The input 'df' in this case should be the sparse matrix itself.
         if df is None:
             raise ValueError("Sparse matrix not provided or loaded correctly.")
-        return df, None # Return None for scaler as scaling is typically not applied to sparse TF-IDF
+        return df, None
 
-    # For dense features
     X = df[feature_cols].copy()
-
-    # Handle potential NaNs that might have slipped through or resulted from merges/ops
     if X.isnull().values.any():
-        print(f"  Warning: NaN values found in selected features {feature_cols}. Imputing with 0.")
+        print(f"  Warning: NaN values found in features {feature_cols}. Imputing with 0.")
         X.fillna(0, inplace=True)
-
-    # Convert to numpy array
     X_np = X.values.astype(np.float32)
 
-    # Scale data
-    if scaler is None:
-        scaler = StandardScaler()
+    current_scaler = scaler if scaler is not None else StandardScaler()
 
     if fit_scaler:
-        X_scaled = scaler.fit_transform(X_np)
-        print(f"    Scaler fitted and data scaled. Feature shape: {X_scaled.shape}")
+        X_scaled = current_scaler.fit_transform(X_np)
+        # print(f"    Scaler fitted and data scaled. Feature shape: {X_scaled.shape}") # Less verbose
+        return X_scaled, current_scaler # Return the fitted scaler
     else:
         if scaler is not None:
             try:
                 X_scaled = scaler.transform(X_np)
-                print(f"    Data scaled using existing scaler. Feature shape: {X_scaled.shape}")
+                # print(f"    Data scaled using existing scaler. Feature shape: {X_scaled.shape}") # Less verbose
             except Exception as e:
                 print(f"    Warning: Scaling failed: {e}. Using unscaled data.")
                 X_scaled = X_np
         else:
-            print("    No scaler provided, using unscaled data.")
+            # print("    No scaler provided, using unscaled data.") # Less verbose
             X_scaled = X_np
+        return X_scaled, scaler # Return the original scaler (or None)
 
 
-    return X_scaled, scaler
-
-# --- Evaluation Function ---
+# --- Evaluation Function (Keep as before) ---
 def evaluate_model(model, X_val, y_val, is_keras=False, batch_size=BATCH_SIZE):
     """Evaluates a model and returns metrics."""
     try:
+        y_pred_proba = None
+        y_pred = None
         if is_keras:
             y_pred_proba = model.predict(X_val, batch_size=batch_size).flatten()
             y_pred = (y_pred_proba > 0.5).astype(int)
@@ -311,403 +257,513 @@ def evaluate_model(model, X_val, y_val, is_keras=False, batch_size=BATCH_SIZE):
             y_pred_proba = model.predict_proba(X_val)[:, 1]
             y_pred = (y_pred_proba > 0.5).astype(int)
         elif hasattr(model, 'decision_function'):
-            # For models like LinearSVC without predict_proba by default
-            # (unless using CalibratedClassifierCV)
             y_scores = model.decision_function(X_val)
             y_pred = (y_scores > 0).astype(int)
-            # Note: y_scores are not probabilities. For late fusion, ensure probabilities.
-            # If using CalibratedClassifierCV, predict_proba will be available.
             if isinstance(model, CalibratedClassifierCV):
                 y_pred_proba = model.predict_proba(X_val)[:, 1]
             else:
-                # Cannot directly get probabilities for late fusion without calibration
-                print("Warning: Using decision_function scores instead of probabilities for late fusion.")
-                y_pred_proba = y_scores # Or apply sigmoid manually: 1 / (1 + np.exp(-y_scores))
+                print("Warning: Using decision_function scores instead of probabilities.")
+                # y_pred_proba = y_scores # Or sigmoid
         else:
             y_pred = model.predict(X_val)
-            y_pred_proba = None # Cannot get probabilities
 
         accuracy = accuracy_score(y_val, y_pred)
         precision, recall, f1, _ = precision_recall_fscore_support(y_val, y_pred, average='binary', zero_division=0)
-
         return accuracy, precision, recall, f1, y_pred_proba, y_pred
-
     except Exception as e:
         print(f"      ERROR during evaluation: {e}")
         return np.nan, np.nan, np.nan, np.nan, None, None
 
+# --- Cross-Validation Function (Keep as before) ---
 
-# --- Main Training and Evaluation Loop ---
-
-def train_and_evaluate_fusion_strategies(df, tfidf_sparse_matrix, label_classes):
-    """Trains and evaluates different fusion strategies using cross-validation."""
-
+def cross_validate_fusion_strategies(df_train, tfidf_sparse_matrix_train, label_classes):
+    """Performs cross-validation on the training set to find the best strategy."""
+    print("\n===== Starting Cross-Validation on Training Set =====")
     # --- Define Feature Sets ---
-    lexical_features = [col for col in ['word_count', 'unique_word_ratio', 'profanity_score'] if col in df.columns]
-    syntactic_features = [col for col in df.columns if col.startswith('pos_')]
-    sentiment_features = [col for col in df.columns if col.startswith('sentiment_')] # Added sentiment
-    tfidf_dense_features = [col for col in df.columns if col.startswith('tfidf_')] # Use pre-calculated dense TF-IDF if available
-
-    print("\nAvailable Feature Sets:")
-    print(f"- Lexical: {lexical_features}")
-    print(f"- Syntactic: {len(syntactic_features)} features (e.g., {syntactic_features[:5]}...)")
-    print(f"- Sentiment: {sentiment_features}")
-    print(f"- Semantic: ['semantic_vector'] ({SEMANTIC_DIM} dims)")
-    if tfidf_sparse_matrix is not None:
-        print(f"- TF-IDF (Sparse): Loaded matrix with shape {tfidf_sparse_matrix.shape}")
-    if tfidf_dense_features:
-        print(f"- TF-IDF (Dense): {len(tfidf_dense_features)} features (e.g., {tfidf_dense_features[:5]}...)")
+    lexical_features = [col for col in ['word_count', 'unique_word_ratio', 'profanity_score'] if col in df_train.columns]
+    syntactic_features = [col for col in df_train.columns if col.startswith('pos_')]
+    sentiment_features = [col for col in df_train.columns if col.startswith('sentiment_')]
+    tfidf_dense_features = [col for col in df_train.columns if col.startswith('tfidf_')]
 
     # --- Target Variable ---
-    y = df['label_encoded'].values
+    y_train_full = df_train['label_encoded'].values
 
     # --- Cross-Validation Setup ---
     skf = StratifiedKFold(n_splits=N_SPLITS, shuffle=True, random_state=RANDOM_STATE)
-    all_results = [] # To store results from each fold and strategy
+    all_results = []
 
     # --- Keras Early Stopping ---
     early_stopping = EarlyStopping(monitor='val_loss', patience=PATIENCE, restore_best_weights=True, verbose=0)
 
     # --- Cross-Validation Loop ---
-    for fold, (train_idx, val_idx) in enumerate(skf.split(df, y)): # Split df to easily access columns
-        print(f"\n{'='*15} FOLD {fold+1}/{N_SPLITS} {'='*15}")
+    for fold, (train_fold_idx, val_fold_idx) in enumerate(skf.split(df_train, y_train_full)):
+        print(f"\n{'='*15} CV FOLD {fold+1}/{N_SPLITS} {'='*15}")
 
-        df_train, df_val = df.iloc[train_idx], df.iloc[val_idx]
-        y_train, y_val = y[train_idx], y[val_idx]
+        df_train_fold, df_val_fold = df_train.iloc[train_fold_idx], df_train.iloc[val_fold_idx]
+        y_train_fold, y_val_fold = y_train_full[train_fold_idx], y_train_full[val_fold_idx]
 
         # --- Prepare Base Feature Sets for this Fold ---
         # TF-IDF (Sparse)
-        X_train_tfidf_sparse, X_val_tfidf_sparse = None, None
-        if tfidf_sparse_matrix is not None:
-            X_train_tfidf_sparse = tfidf_sparse_matrix[train_idx]
-            X_val_tfidf_sparse = tfidf_sparse_matrix[val_idx]
-            print(f"  Prepared Sparse TF-IDF: Train {X_train_tfidf_sparse.shape}, Val {X_val_tfidf_sparse.shape}")
+        X_train_fold_tfidf_sparse, X_val_fold_tfidf_sparse = None, None
+        if tfidf_sparse_matrix_train is not None:
+            X_train_fold_tfidf_sparse = tfidf_sparse_matrix_train[train_fold_idx]
+            X_val_fold_tfidf_sparse = tfidf_sparse_matrix_train[val_fold_idx]
+            # print(f"  Prepared Sparse TF-IDF: Train {X_train_fold_tfidf_sparse.shape}, Val {X_val_fold_tfidf_sparse.shape}") # Less verbose
 
-        # TF-IDF (Dense - if available)
-        X_train_tfidf_dense, X_val_tfidf_dense, scaler_tfidf_dense = None, None, None
+        # TF-IDF (Dense)
+        X_train_fold_tfidf_dense, X_val_fold_tfidf_dense, scaler_tfidf_dense = None, None, None
         if tfidf_dense_features:
-            X_train_tfidf_dense, scaler_tfidf_dense = prepare_features(df_train, tfidf_dense_features, fit_scaler=True)
-            X_val_tfidf_dense, _ = prepare_features(df_val, tfidf_dense_features, scaler=scaler_tfidf_dense)
-            print(f"  Prepared Dense TF-IDF: Train {X_train_tfidf_dense.shape}, Val {X_val_tfidf_dense.shape}")
+            X_train_fold_tfidf_dense, scaler_tfidf_dense = prepare_features(df_train_fold, tfidf_dense_features, fit_scaler=True)
+            X_val_fold_tfidf_dense, _ = prepare_features(df_val_fold, tfidf_dense_features, scaler=scaler_tfidf_dense)
+            # print(f"  Prepared Dense TF-IDF: Train {X_train_fold_tfidf_dense.shape}, Val {X_val_fold_tfidf_dense.shape}") # Less verbose
 
-        # Lexical Features
-        X_train_lex, X_val_lex, scaler_lex = None, None, None
+        # Lexical
+        X_train_fold_lex, X_val_fold_lex, scaler_lex = None, None, None
         if lexical_features:
-            X_train_lex, scaler_lex = prepare_features(df_train, lexical_features, fit_scaler=True)
-            X_val_lex, _ = prepare_features(df_val, lexical_features, scaler=scaler_lex)
-            print(f"  Prepared Lexical: Train {X_train_lex.shape}, Val {X_val_lex.shape}")
+            X_train_fold_lex, scaler_lex = prepare_features(df_train_fold, lexical_features, fit_scaler=True)
+            X_val_fold_lex, _ = prepare_features(df_val_fold, lexical_features, scaler=scaler_lex)
+            # print(f"  Prepared Lexical: Train {X_train_fold_lex.shape}, Val {X_val_fold_lex.shape}") # Less verbose
 
-        # Syntactic Features
-        X_train_syn, X_val_syn, scaler_syn = None, None, None
+        # Syntactic
+        X_train_fold_syn, X_val_fold_syn, scaler_syn = None, None, None
         if syntactic_features:
-            X_train_syn, scaler_syn = prepare_features(df_train, syntactic_features, fit_scaler=True)
-            X_val_syn, _ = prepare_features(df_val, syntactic_features, scaler=scaler_syn)
-            print(f"  Prepared Syntactic: Train {X_train_syn.shape}, Val {X_val_syn.shape}")
+            X_train_fold_syn, scaler_syn = prepare_features(df_train_fold, syntactic_features, fit_scaler=True)
+            X_val_fold_syn, _ = prepare_features(df_val_fold, syntactic_features, scaler=scaler_syn)
+            # print(f"  Prepared Syntactic: Train {X_train_fold_syn.shape}, Val {X_val_fold_syn.shape}") # Less verbose
 
-        # Semantic Features
-        X_train_sem, X_val_sem, scaler_sem = None, None, None
-        if 'semantic_vector' in df.columns:
-            # Semantic vectors are already numpy arrays after preprocessing
-            X_train_sem_raw = np.stack(df_train['semantic_vector'].values)
-            X_val_sem_raw = np.stack(df_val['semantic_vector'].values)
-            # Scale semantic features
+        # Semantic
+        X_train_fold_sem, X_val_fold_sem, scaler_sem = None, None, None
+        if 'semantic_vector' in df_train.columns:
+            X_train_fold_sem_raw = np.stack(df_train_fold['semantic_vector'].values)
+            X_val_fold_sem_raw = np.stack(df_val_fold['semantic_vector'].values)
             scaler_sem = StandardScaler()
-            X_train_sem = scaler_sem.fit_transform(X_train_sem_raw)
-            X_val_sem = scaler_sem.transform(X_val_sem_raw)
-            print(f"  Prepared Semantic: Train {X_train_sem.shape}, Val {X_val_sem.shape}")
+            X_train_fold_sem = scaler_sem.fit_transform(X_train_fold_sem_raw)
+            X_val_fold_sem = scaler_sem.transform(X_val_fold_sem_raw)
+            # print(f"  Prepared Semantic: Train {X_train_fold_sem.shape}, Val {X_val_fold_sem.shape}") # Less verbose
 
-        # --- Strategy 1: Early Fusion (TF-IDF Dense + Lexical + Syntactic -> SVM) ---
-        print("\n  --- Strategy: Early Fusion (TF-IDF Dense + Lex + Syn -> SVM) ---")
-        if X_train_tfidf_dense is not None and X_train_lex is not None and X_train_syn is not None:
+        # --- Evaluate Strategies for this Fold ---
+        strategies_to_run = [
+            'Early (TFIDF_Dense+Lex+Syn -> SVM)',
+            'Intermediate (Sem+Syn -> BiLSTM)',
+            'Late Fusion (Avg Prob)',
+            'Baseline (TF-IDF Sparse -> SVM)',
+            'Baseline (Semantic -> Dense NN)'
+        ]
+
+        for strategy_name in strategies_to_run:
+            # print(f"\n  --- Evaluating Strategy: {strategy_name} ---") # Less verbose
+            acc, pre, rec, f1 = np.nan, np.nan, np.nan, np.nan # Default to NaN
+
             try:
-                # Combine features (ensure all are dense and scaled)
-                X_train_early = np.hstack((X_train_tfidf_dense, X_train_lex, X_train_syn))
-                X_val_early = np.hstack((X_val_tfidf_dense, X_val_lex, X_val_syn))
-                print(f"    Combined Early Features Shape: Train {X_train_early.shape}, Val {X_val_early.shape}")
+                if strategy_name == 'Early (TFIDF_Dense+Lex+Syn -> SVM)':
+                    if X_train_fold_tfidf_dense is not None and X_train_fold_lex is not None and X_train_fold_syn is not None:
+                        X_train_early = np.hstack((X_train_fold_tfidf_dense, X_train_fold_lex, X_train_fold_syn))
+                        X_val_early = np.hstack((X_val_fold_tfidf_dense, X_val_fold_lex, X_val_fold_syn))
+                        model_early = build_svm(kernel='rbf', probability=True, random_state=RANDOM_STATE + fold)
+                        model_early.fit(X_train_early, y_train_fold)
+                        acc, pre, rec, f1, _, _ = evaluate_model(model_early, X_val_early, y_val_fold)
+                        del model_early, X_train_early, X_val_early
+                    # else: print("    Skipping: Missing required dense features.") # Less verbose
 
-                # Train SVM (using SVC with RBF kernel as an example, could use LinearSVC too)
-                model_early = build_svm(kernel='rbf', probability=True, random_state=RANDOM_STATE + fold)
-                print("    Training Early Fusion SVM...")
-                model_early.fit(X_train_early, y_train)
-                print("    Evaluating Early Fusion SVM...")
-                acc, pre, rec, f1, _, _ = evaluate_model(model_early, X_val_early, y_val)
-                print(f"    Early Fusion Metrics: Acc={acc:.4f}, P={pre:.4f}, R={rec:.4f}, F1={f1:.4f}")
-                all_results.append({'fold': fold+1, 'strategy': 'Early (TFIDF_Dense+Lex+Syn -> SVM)', 'accuracy': acc, 'precision': pre, 'recall': rec, 'f1_score': f1})
-                del model_early, X_train_early, X_val_early # Clean up memory
-                gc.collect()
-            except Exception as e:
-                print(f"    ERROR during Early Fusion: {e}")
-                all_results.append({'fold': fold+1, 'strategy': 'Early (TFIDF_Dense+Lex+Syn -> SVM)', 'accuracy': np.nan, 'precision': np.nan, 'recall': np.nan, 'f1_score': np.nan})
-        else:
-            print("    Skipping Early Fusion: Missing required dense feature sets.")
+                elif strategy_name == 'Intermediate (Sem+Syn -> BiLSTM)':
+                    if X_train_fold_sem is not None and X_train_fold_syn is not None:
+                        current_semantic_dim = X_train_fold_sem.shape[1]
+                        current_syntactic_dim = X_train_fold_syn.shape[1]
+                        model_intermediate = build_bilstm_intermediate(current_semantic_dim, current_syntactic_dim)
+                        history = model_intermediate.fit(
+                            [X_train_fold_sem, X_train_fold_syn], y_train_fold,
+                            validation_data=([X_val_fold_sem, X_val_fold_syn], y_val_fold),
+                            epochs=EPOCHS, batch_size=BATCH_SIZE, callbacks=[early_stopping], verbose=0
+                        )
+                        acc, pre, rec, f1, _, _ = evaluate_model(model_intermediate, [X_val_fold_sem, X_val_fold_syn], y_val_fold, is_keras=True)
+                        tf.keras.backend.clear_session()
+                        del model_intermediate, history
+                    # else: print("    Skipping: Missing Semantic or Syntactic features.") # Less verbose
 
+                elif strategy_name == 'Late Fusion (Avg Prob)':
+                    if X_train_fold_tfidf_sparse is not None and X_train_fold_sem is not None:
+                        # Model 1: SVM
+                        model_late_svm = build_svm(kernel='linear', probability=True, random_state=RANDOM_STATE + fold)
+                        model_late_svm.fit(X_train_fold_tfidf_sparse, y_train_fold)
+                        _, _, _, _, svm_probs, _ = evaluate_model(model_late_svm, X_val_fold_tfidf_sparse, y_val_fold)
+                        # Model 2: NN
+                        tf.random.set_seed(RANDOM_STATE + fold)
+                        model_late_nn = build_dense_for_semantic(input_dim=X_train_fold_sem.shape[1])
+                        history_nn = model_late_nn.fit(X_train_fold_sem, y_train_fold,
+                                                       epochs=EPOCHS, batch_size=BATCH_SIZE,
+                                                       validation_data=(X_val_fold_sem, y_val_fold),
+                                                       callbacks=[early_stopping], verbose=0)
+                        _, _, _, _, nn_probs, _ = evaluate_model(model_late_nn, X_val_fold_sem, y_val_fold, is_keras=True)
 
-        # --- Strategy 2: Intermediate Fusion (Semantic + Syntactic -> Bi-LSTM) ---
-        print("\n  --- Strategy: Intermediate Fusion (Semantic + Syn -> Bi-LSTM) ---")
-        if X_train_sem is not None and X_train_syn is not None:
-            try:
-                # Ensure syntactic features are scaled
-                X_train_syn_scaled, scaler_syn_inter = prepare_features(df_train, syntactic_features, fit_scaler=True)
-                X_val_syn_scaled, _ = prepare_features(df_val, syntactic_features, scaler=scaler_syn_inter)
+                        if svm_probs is not None and nn_probs is not None:
+                            avg_probs = (svm_probs + nn_probs) / 2
+                            y_pred_late = (avg_probs > 0.5).astype(int)
+                            acc = accuracy_score(y_val_fold, y_pred_late)
+                            pre, rec, f1, _ = precision_recall_fscore_support(y_val_fold, y_pred_late, average='binary', zero_division=0)
+                        # else: print("    Skipping evaluation due to missing probabilities.") # Less verbose
+                        tf.keras.backend.clear_session()
+                        del model_late_svm, model_late_nn, svm_probs, nn_probs, history_nn
+                    # else: print("    Skipping: Missing Sparse TF-IDF or Semantic features.") # Less verbose
 
-                # Semantic features are already scaled
-                current_semantic_dim = X_train_sem.shape[1]
-                current_syntactic_dim = X_train_syn_scaled.shape[1]
+                elif strategy_name == 'Baseline (TF-IDF Sparse -> SVM)':
+                    if X_train_fold_tfidf_sparse is not None:
+                        model_base_svm = build_svm(kernel='linear', probability=False, random_state=RANDOM_STATE + fold)
+                        model_base_svm.fit(X_train_fold_tfidf_sparse, y_train_fold)
+                        acc, pre, rec, f1, _, _ = evaluate_model(model_base_svm, X_val_fold_tfidf_sparse, y_val_fold)
+                        del model_base_svm
+                    # else: print("    Skipping: Missing Sparse TF-IDF features.") # Less verbose
 
-                model_intermediate = build_bilstm_intermediate(current_semantic_dim, current_syntactic_dim)
-                # model_intermediate.summary() # Optional: print model summary
+                elif strategy_name == 'Baseline (Semantic -> Dense NN)':
+                    if X_train_fold_sem is not None:
+                        tf.random.set_seed(RANDOM_STATE + fold)
+                        model_base_nn = build_dense_for_semantic(input_dim=X_train_fold_sem.shape[1])
+                        history_base_nn = model_base_nn.fit(X_train_fold_sem, y_train_fold,
+                                                            epochs=EPOCHS, batch_size=BATCH_SIZE,
+                                                            validation_data=(X_val_fold_sem, y_val_fold),
+                                                            callbacks=[early_stopping], verbose=0)
+                        acc, pre, rec, f1, _, _ = evaluate_model(model_base_nn, X_val_fold_sem, y_val_fold, is_keras=True)
+                        tf.keras.backend.clear_session()
+                        del model_base_nn, history_base_nn
+                    # else: print("    Skipping: Missing Semantic features.") # Less verbose
 
-                print("    Training Intermediate Fusion Bi-LSTM...")
-                history = model_intermediate.fit(
-                    [X_train_sem, X_train_syn_scaled], y_train,
-                    validation_data=([X_val_sem, X_val_syn_scaled], y_val),
-                    epochs=EPOCHS,
-                    batch_size=BATCH_SIZE,
-                    callbacks=[early_stopping],
-                    verbose=0 # Set to 1 or 2 for more details during training
-                )
-                print(f"    Training completed after {len(history.history['loss'])} epochs.")
-
-                print("    Evaluating Intermediate Fusion Bi-LSTM...")
-                acc, pre, rec, f1, _, _ = evaluate_model(model_intermediate, [X_val_sem, X_val_syn_scaled], y_val, is_keras=True)
-                print(f"    Intermediate Fusion Metrics: Acc={acc:.4f}, P={pre:.4f}, R={rec:.4f}, F1={f1:.4f}")
-                all_results.append({'fold': fold+1, 'strategy': 'Intermediate (Sem+Syn -> BiLSTM)', 'accuracy': acc, 'precision': pre, 'recall': rec, 'f1_score': f1})
-
-                tf.keras.backend.clear_session() # Clear Keras session
-                del model_intermediate, X_train_syn_scaled, X_val_syn_scaled, scaler_syn_inter, history # Clean up memory
-                gc.collect()
-
-            except Exception as e:
-                print(f"    ERROR during Intermediate Fusion: {e}")
-                all_results.append({'fold': fold+1, 'strategy': 'Intermediate (Sem+Syn -> BiLSTM)', 'accuracy': np.nan, 'precision': np.nan, 'recall': np.nan, 'f1_score': np.nan})
-                tf.keras.backend.clear_session() # Ensure session is cleared even on error
-                gc.collect()
-        else:
-            print("    Skipping Intermediate Fusion: Missing Semantic or Syntactic features.")
-
-
-        # --- Strategy 3: Late Fusion (Average Probabilities: TF-IDF Sparse SVM + Semantic Dense NN) ---
-        print("\n  --- Strategy: Late Fusion (TF-IDF_Sparse->SVM + Semantic->DenseNN) ---")
-        if X_train_tfidf_sparse is not None and X_train_sem is not None:
-            try:
-                # Model 1: SVM on TF-IDF Sparse
-                print("    Training Late Fusion Model 1 (SVM on TF-IDF)...")
-                # Use LinearSVC with calibration for probabilities
-                model_late_svm = build_svm(kernel='linear', probability=True, random_state=RANDOM_STATE + fold)
-                model_late_svm.fit(X_train_tfidf_sparse, y_train)
-                print("    Evaluating Late Fusion Model 1 (SVM)...")
-                _, _, _, _, svm_probs, _ = evaluate_model(model_late_svm, X_val_tfidf_sparse, y_val)
-
-                # Model 2: Dense NN on Semantic Features
-                print("    Training Late Fusion Model 2 (Dense NN on Semantic)...")
-                tf.random.set_seed(RANDOM_STATE + fold) # Seed for Keras model
-                model_late_nn = build_dense_for_semantic(input_dim=X_train_sem.shape[1])
-                history_nn = model_late_nn.fit(X_train_sem, y_train,
-                                               epochs=EPOCHS,
-                                               batch_size=BATCH_SIZE,
-                                               validation_data=(X_val_sem, y_val),
-                                               callbacks=[early_stopping],
-                                               verbose=0)
-                print(f"    NN Training completed after {len(history_nn.history['loss'])} epochs.")
-                print("    Evaluating Late Fusion Model 2 (NN)...")
-                _, _, _, _, nn_probs, _ = evaluate_model(model_late_nn, X_val_sem, y_val, is_keras=True)
-
-                # Late Fusion: Average Probabilities
-                if svm_probs is not None and nn_probs is not None:
-                    avg_probs = (svm_probs + nn_probs) / 2
-                    y_pred_late = (avg_probs > 0.5).astype(int)
-
-                    # Evaluate Late Fusion
-                    accuracy_late = accuracy_score(y_val, y_pred_late)
-                    precision_late, recall_late, f1_late, _ = precision_recall_fscore_support(y_val, y_pred_late, average='binary', zero_division=0)
-                    print(f"    Late Fusion Metrics: Acc={accuracy_late:.4f}, P={precision_late:.4f}, R={recall_late:.4f}, F1={f1_late:.4f}")
-                    all_results.append({'fold': fold+1, 'strategy': 'Late Fusion (Avg Prob)', 'accuracy': accuracy_late, 'precision': precision_late, 'recall': recall_late, 'f1_score': f1_late})
-                else:
-                    print("    Skipping Late Fusion evaluation due to missing probabilities.")
-                    all_results.append({'fold': fold+1, 'strategy': 'Late Fusion (Avg Prob)', 'accuracy': np.nan, 'precision': np.nan, 'recall': np.nan, 'f1_score': np.nan})
-
-
-                tf.keras.backend.clear_session() # Clear Keras session
-                del model_late_svm, model_late_nn, svm_probs, nn_probs, history_nn # Clean up memory
-                gc.collect()
+                # Record results for the strategy in this fold
+                # print(f"    {strategy_name} Metrics: Acc={acc:.4f}, P={pre:.4f}, R={rec:.4f}, F1={f1:.4f}") # Less verbose
+                all_results.append({'fold': fold+1, 'strategy': strategy_name, 'accuracy': acc, 'precision': pre, 'recall': rec, 'f1_score': f1})
 
             except Exception as e:
-                print(f"    ERROR during Late Fusion: {e}")
-                all_results.append({'fold': fold+1, 'strategy': 'Late Fusion (Avg Prob)', 'accuracy': np.nan, 'precision': np.nan, 'recall': np.nan, 'f1_score': np.nan})
-                tf.keras.backend.clear_session() # Ensure session is cleared even on error
-                gc.collect()
-        else:
-            print("    Skipping Late Fusion: Missing Sparse TF-IDF or Semantic features.")
+                print(f"    ERROR during strategy '{strategy_name}': {e}")
+                all_results.append({'fold': fold+1, 'strategy': strategy_name, 'accuracy': np.nan, 'precision': np.nan, 'recall': np.nan, 'f1_score': np.nan})
+                if 'model_intermediate' in locals() or 'model_late_nn' in locals() or 'model_base_nn' in locals():
+                    tf.keras.backend.clear_session() # Clear session if Keras model was involved in error
+            finally:
+                gc.collect() # Force garbage collection after each strategy
 
-        # --- Optional: Add Baseline Models (from Phase 3 logic if needed for comparison) ---
-        # Example: Baseline SVM on TF-IDF only
-        print("\n  --- Strategy: Baseline (TF-IDF Sparse -> SVM) ---")
-        if X_train_tfidf_sparse is not None:
-            try:
-                model_base_svm = build_svm(kernel='linear', probability=False, random_state=RANDOM_STATE + fold) # No need for probability here
-                print("    Training Baseline SVM...")
-                model_base_svm.fit(X_train_tfidf_sparse, y_train)
-                print("    Evaluating Baseline SVM...")
-                acc, pre, rec, f1, _, _ = evaluate_model(model_base_svm, X_val_tfidf_sparse, y_val)
-                print(f"    Baseline TF-IDF SVM Metrics: Acc={acc:.4f}, P={pre:.4f}, R={rec:.4f}, F1={f1:.4f}")
-                all_results.append({'fold': fold+1, 'strategy': 'Baseline (TF-IDF Sparse -> SVM)', 'accuracy': acc, 'precision': pre, 'recall': rec, 'f1_score': f1})
-                del model_base_svm
-                gc.collect()
-            except Exception as e:
-                print(f"    ERROR during Baseline SVM: {e}")
-                all_results.append({'fold': fold+1, 'strategy': 'Baseline (TF-IDF Sparse -> SVM)', 'accuracy': np.nan, 'precision': np.nan, 'recall': np.nan, 'f1_score': np.nan})
-        else:
-            print("    Skipping Baseline TF-IDF SVM: Missing Sparse TF-IDF features.")
-
-        # Example: Baseline Dense NN on Semantic only
-        print("\n  --- Strategy: Baseline (Semantic -> Dense NN) ---")
-        if X_train_sem is not None:
-            try:
-                tf.random.set_seed(RANDOM_STATE + fold) # Seed for Keras model
-                model_base_nn = build_dense_for_semantic(input_dim=X_train_sem.shape[1])
-                print("    Training Baseline Dense NN...")
-                history_base_nn = model_base_nn.fit(X_train_sem, y_train,
-                                                    epochs=EPOCHS,
-                                                    batch_size=BATCH_SIZE,
-                                                    validation_data=(X_val_sem, y_val),
-                                                    callbacks=[early_stopping],
-                                                    verbose=0)
-                print(f"    Training completed after {len(history_base_nn.history['loss'])} epochs.")
-                print("    Evaluating Baseline Dense NN...")
-                acc, pre, rec, f1, _, _ = evaluate_model(model_base_nn, X_val_sem, y_val, is_keras=True)
-                print(f"    Baseline Semantic NN Metrics: Acc={acc:.4f}, P={pre:.4f}, R={rec:.4f}, F1={f1:.4f}")
-                all_results.append({'fold': fold+1, 'strategy': 'Baseline (Semantic -> Dense NN)', 'accuracy': acc, 'precision': pre, 'recall': rec, 'f1_score': f1})
-
-                tf.keras.backend.clear_session() # Clear Keras session
-                del model_base_nn, history_base_nn # Clean up memory
-                gc.collect()
-            except Exception as e:
-                print(f"    ERROR during Baseline Dense NN: {e}")
-                all_results.append({'fold': fold+1, 'strategy': 'Baseline (Semantic -> Dense NN)', 'accuracy': np.nan, 'precision': np.nan, 'recall': np.nan, 'f1_score': np.nan})
-                tf.keras.backend.clear_session() # Ensure session is cleared even on error
-                gc.collect()
-        else:
-            print("    Skipping Baseline Semantic NN: Missing Semantic features.")
-
-        # Clean up common variables for the fold
-        del df_train, df_val, y_train, y_val
-        del X_train_tfidf_sparse, X_val_tfidf_sparse
-        if tfidf_dense_features: del X_train_tfidf_dense, X_val_tfidf_dense, scaler_tfidf_dense
-        if lexical_features: del X_train_lex, X_val_lex, scaler_lex
-        if syntactic_features: del X_train_syn, X_val_syn, scaler_syn
-        if 'semantic_vector' in df.columns: del X_train_sem, X_val_sem, scaler_sem, X_train_sem_raw, X_val_sem_raw
+        # Clean up fold-specific data
+        del df_train_fold, df_val_fold, y_train_fold, y_val_fold
+        del X_train_fold_tfidf_sparse, X_val_fold_tfidf_sparse
+        if tfidf_dense_features: del X_train_fold_tfidf_dense, X_val_fold_tfidf_dense, scaler_tfidf_dense
+        if lexical_features: del X_train_fold_lex, X_val_fold_lex, scaler_lex
+        if syntactic_features: del X_train_fold_syn, X_val_fold_syn, scaler_syn
+        if 'semantic_vector' in df_train.columns: del X_train_fold_sem, X_val_fold_sem, scaler_sem, X_train_fold_sem_raw, X_val_fold_sem_raw
         gc.collect()
 
-
-    # --- Final Results Processing ---
+    print("\n===== Cross-Validation Finished =====")
     results_df = pd.DataFrame(all_results)
     return results_df
 
-# --- Main Execution ---
+# --- Function to Save Final Model (Keep as before) ---
+def save_final_model(model, strategy_name, output_dir, model_name="final_model"):
+    """Saves the final trained model."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    # Sanitize strategy name for filename
+    safe_strategy_name = "".join(c if c.isalnum() else "_" for c in strategy_name)
+    filename_base = f"{safe_strategy_name}_{model_name}"
+
+    if isinstance(model, (list, tuple)) and 'Late Fusion' in strategy_name:
+        # Save both models for late fusion
+        model_svm, model_nn = model
+        path_svm = output_dir / f"{filename_base}_svm.pkl"
+        path_nn = output_dir / f"{filename_base}_nn.h5"
+        try:
+            joblib.dump(model_svm, path_svm)
+            model_nn.save(path_nn)
+            print(f"Late fusion models saved: {path_svm}, {path_nn}")
+            return str(path_svm), str(path_nn) # Return paths
+        except Exception as e:
+            print(f"Error saving late fusion models: {e}")
+            return None, None
+    elif hasattr(model, 'save'): # Keras model
+        path = output_dir / f"{filename_base}.h5"
+        try:
+            model.save(path)
+            print(f"Final Keras model saved: {path}")
+            return str(path)
+        except Exception as e:
+            print(f"Error saving Keras model {path}: {e}")
+            return None
+    else: # Scikit-learn model
+        path = output_dir / f"{filename_base}.pkl"
+        try:
+            joblib.dump(model, path)
+            print(f"Final scikit-learn model saved: {path}")
+            return str(path)
+        except Exception as e:
+            print(f"Error saving scikit-learn model {path}: {e}")
+            return None
+
+# --- Main Execution (Modified) ---
 if __name__ == "__main__":
     # Define paths
     data_dir = Path('data/processed')
     input_file = data_dir / 'phase2_output.csv'
-    tfidf_sparse_file = data_dir / 'tfidf_matrix.npz' # Assuming this was saved in phase 1 or 2
-    output_dir = Path('results/phase4') # Specific output dir for this phase
-    output_file = output_dir / 'fusion_model_results.csv'
-    summary_file = output_dir / 'fusion_model_summary.csv'
+    tfidf_sparse_file = data_dir / 'tfidf_matrix.npz'
+    output_dir = Path('results/phase4')
+    cv_output_file = output_dir / 'cv_fusion_results.csv'
+    cv_summary_file = output_dir / 'cv_fusion_summary.csv'
+    test_output_file = output_dir / 'test_set_fusion_results.csv' # New file for test results
+    final_model_dir = Path('models/phase4') # Directory to save final models
 
-    # Ensure output directory exists
+    # Ensure output directories exist
     output_dir.mkdir(parents=True, exist_ok=True)
+    final_model_dir.mkdir(parents=True, exist_ok=True)
 
-    # Load and preprocess data
+    # 1. Load and preprocess data
     df, tfidf_sparse_matrix, label_classes = load_and_preprocess_data(input_file, tfidf_sparse_file)
-
-    # Check if DataFrame is empty after preprocessing
     if df.empty:
-        print("Error: DataFrame is empty after preprocessing. Cannot proceed with training.")
+        print("Error: DataFrame is empty after preprocessing. Cannot proceed.")
         sys.exit(1)
 
-    # Train and evaluate models with different fusion strategies
-    results_df = train_and_evaluate_fusion_strategies(df, tfidf_sparse_matrix, label_classes)
+    # 2. Split data into Training and Test sets
+    print(f"\nSplitting data into Train ({1-TEST_SET_SIZE:.0%}) and Test ({TEST_SET_SIZE:.0%})...")
+    train_indices, test_indices = train_test_split(
+        np.arange(len(df)),
+        test_size=TEST_SET_SIZE,
+        random_state=RANDOM_STATE,
+        stratify=df['label_encoded'].values
+    )
+    df_train = df.iloc[train_indices].copy().reset_index(drop=True) # Reset index for easier handling
+    df_test = df.iloc[test_indices].copy().reset_index(drop=True)
+    y_train_full = df_train['label_encoded'].values
+    y_test = df_test['label_encoded'].values
 
-    # Save detailed results
-    if not results_df.empty:
-        print(f"\nSaving detailed fold results to: {output_file}")
-        results_df.to_csv(output_file, index=False)
+    tfidf_sparse_matrix_train = None
+    tfidf_sparse_matrix_test = None
+    if tfidf_sparse_matrix is not None:
+        tfidf_sparse_matrix_train = tfidf_sparse_matrix[train_indices]
+        tfidf_sparse_matrix_test = tfidf_sparse_matrix[test_indices]
+        print(f"Split sparse TF-IDF: Train {tfidf_sparse_matrix_train.shape}, Test {tfidf_sparse_matrix_test.shape}")
 
-        # Calculate and display average results per strategy
-        print("\n--- Average Performance Across Folds (Grouped by Strategy) ---")
-        avg_results = results_df.groupby('strategy')[['accuracy', 'precision', 'recall', 'f1_score']].agg(['mean', 'std'])
+    print(f"Train set size: {len(df_train)}, Test set size: {len(df_test)}")
 
-        # Format for better readability
-        avg_results.columns = ['_'.join(col).strip() for col in avg_results.columns.values]
-        avg_results = avg_results.rename(columns={
+    # 3. Perform Cross-Validation on the Training Set
+    cv_results_df = cross_validate_fusion_strategies(df_train, tfidf_sparse_matrix_train, label_classes)
+
+    # 4. Save and Analyze CV Results
+    if not cv_results_df.empty:
+        print(f"\nSaving detailed CV results to: {cv_output_file}")
+        cv_results_df.to_csv(cv_output_file, index=False)
+
+        print("\n--- Average CV Performance Across Folds (Grouped by Strategy) ---")
+        avg_cv_results = cv_results_df.groupby('strategy')[['accuracy', 'precision', 'recall', 'f1_score']].agg(['mean', 'std'])
+        avg_cv_results.columns = ['_'.join(col).strip() for col in avg_cv_results.columns.values]
+        avg_cv_results = avg_cv_results.rename(columns={
             'accuracy_mean': 'Avg Accuracy', 'accuracy_std': 'Std Dev Acc',
             'precision_mean': 'Avg Precision', 'precision_std': 'Std Dev Prec',
             'recall_mean': 'Avg Recall', 'recall_std': 'Std Dev Rec',
             'f1_score_mean': 'Avg F1-Score', 'f1_score_std': 'Std Dev F1'
         })
-        avg_results = avg_results.sort_values(by='Avg F1-Score', ascending=False)
+        avg_cv_results = avg_cv_results.sort_values(by='Avg F1-Score', ascending=False)
+        print(avg_cv_results)
+        print(f"\nSaving CV summary results to: {cv_summary_file}")
+        avg_cv_results.to_csv(cv_summary_file)
 
-        print(avg_results)
-        print(f"\nSaving summary results to: {summary_file}")
-        avg_results.to_csv(summary_file)
+        # Get list of strategies evaluated during CV
+        evaluated_strategies = cv_results_df['strategy'].unique()
 
     else:
-        print("\nNo results were generated during model training and evaluation.")
+        print("\nNo CV results were generated. Cannot proceed with final model training.")
+        sys.exit(1)
+
+
+    # 5. Train Final Model for EACH Strategy on Entire Training Set and Evaluate on Test Set
+    print(f"\n===== Training Final Models on Full Training Set & Evaluating on Test Set =====")
+    all_test_results = []
+    saved_model_paths = {} # Store paths of saved models
+
+    # Define feature sets based on full training data
+    lexical_features = [col for col in df_train.columns if col in ['word_count', 'unique_word_ratio', 'profanity_score']]
+    syntactic_features = [col for col in df_train.columns if col.startswith('pos_')]
+    tfidf_dense_features = [col for col in df_train.columns if col.startswith('tfidf_')]
+
+    # Prepare scalers fitted on the full training data ONCE
+    scalers = {}
+    if tfidf_dense_features:
+        _, scalers['tfidf_dense'] = prepare_features(df_train, tfidf_dense_features, fit_scaler=True)
+    if lexical_features:
+        _, scalers['lex'] = prepare_features(df_train, lexical_features, fit_scaler=True)
+    if syntactic_features:
+        _, scalers['syn'] = prepare_features(df_train, syntactic_features, fit_scaler=True)
+    if 'semantic_vector' in df_train.columns:
+        X_train_sem_raw_full = np.stack(df_train['semantic_vector'].values)
+        scalers['sem'] = StandardScaler().fit(X_train_sem_raw_full)
+        # Save scalers immediately
+        for name, scaler in scalers.items():
+            joblib.dump(scaler, final_model_dir / f'scaler_{name}.pkl')
+        print("Saved scalers fitted on full training data.")
+
+
+    for strategy_name in evaluated_strategies:
+        print(f"\n--- Processing Strategy for Final Training & Test: {strategy_name} ---")
+        final_model = None
+        test_features = None
+        is_keras_final = False
+        acc_test, pre_test, rec_test, f1_test = np.nan, np.nan, np.nan, np.nan
+
+        try:
+            # Prepare features for this strategy using full train/test sets and fitted scalers
+            if strategy_name == 'Early (TFIDF_Dense+Lex+Syn -> SVM)':
+                if tfidf_dense_features and lexical_features and syntactic_features:
+                    X_train_tfidf_dense, _ = prepare_features(df_train, tfidf_dense_features, scaler=scalers.get('tfidf_dense'))
+                    X_test_tfidf_dense, _ = prepare_features(df_test, tfidf_dense_features, scaler=scalers.get('tfidf_dense'))
+                    X_train_lex, _ = prepare_features(df_train, lexical_features, scaler=scalers.get('lex'))
+                    X_test_lex, _ = prepare_features(df_test, lexical_features, scaler=scalers.get('lex'))
+                    X_train_syn, _ = prepare_features(df_train, syntactic_features, scaler=scalers.get('syn'))
+                    X_test_syn, _ = prepare_features(df_test, syntactic_features, scaler=scalers.get('syn'))
+
+                    X_train_final = np.hstack((X_train_tfidf_dense, X_train_lex, X_train_syn))
+                    test_features = np.hstack((X_test_tfidf_dense, X_test_lex, X_test_syn))
+
+                    final_model = build_svm(kernel='rbf', probability=True, random_state=RANDOM_STATE)
+                    print("  Training final Early Fusion SVM...")
+                    final_model.fit(X_train_final, y_train_full)
+                else: print("  Cannot train final Early Fusion model: Missing required features.")
+
+            elif strategy_name == 'Intermediate (Sem+Syn -> BiLSTM)':
+                if 'semantic_vector' in df_train.columns and syntactic_features:
+                    X_train_sem_raw = np.stack(df_train['semantic_vector'].values)
+                    X_test_sem_raw = np.stack(df_test['semantic_vector'].values)
+                    X_train_sem = scalers['sem'].transform(X_train_sem_raw)
+                    X_test_sem = scalers['sem'].transform(X_test_sem_raw)
+
+                    X_train_syn, _ = prepare_features(df_train, syntactic_features, scaler=scalers.get('syn'))
+                    X_test_syn, _ = prepare_features(df_test, syntactic_features, scaler=scalers.get('syn'))
+
+                    test_features = [X_test_sem, X_test_syn]
+                    is_keras_final = True
+
+                    final_model = build_bilstm_intermediate(X_train_sem.shape[1], X_train_syn.shape[1])
+                    print("  Training final Intermediate Fusion Bi-LSTM...")
+                    final_model.fit([X_train_sem, X_train_syn], y_train_full,
+                                    epochs=EPOCHS, batch_size=BATCH_SIZE, verbose=0) # Reduced verbosity
+                else: print("  Cannot train final Intermediate Fusion model: Missing required features.")
+
+            elif strategy_name == 'Late Fusion (Avg Prob)':
+                if tfidf_sparse_matrix_train is not None and 'semantic_vector' in df_train.columns:
+                    # Train SVM model
+                    model_svm = build_svm(kernel='linear', probability=True, random_state=RANDOM_STATE)
+                    print("  Training final Late Fusion SVM...")
+                    model_svm.fit(tfidf_sparse_matrix_train, y_train_full)
+
+                    # Train NN model
+                    X_train_sem_raw = np.stack(df_train['semantic_vector'].values)
+                    X_test_sem_raw = np.stack(df_test['semantic_vector'].values)
+                    X_train_sem = scalers['sem'].transform(X_train_sem_raw)
+                    X_test_sem = scalers['sem'].transform(X_test_sem_raw)
+
+                    tf.random.set_seed(RANDOM_STATE)
+                    model_nn = build_dense_for_semantic(input_dim=X_train_sem.shape[1])
+                    print("  Training final Late Fusion Dense NN...")
+                    # Consider adding early stopping based on a small validation split from training data if needed
+                    model_nn.fit(X_train_sem, y_train_full, epochs=EPOCHS, batch_size=BATCH_SIZE, verbose=0)
+
+                    final_model = (model_svm, model_nn) # Store tuple of models
+                    test_features = (tfidf_sparse_matrix_test, X_test_sem) # Tuple of test features
+                else: print("  Cannot train final Late Fusion models: Missing required features.")
+
+            elif strategy_name == 'Baseline (TF-IDF Sparse -> SVM)':
+                if tfidf_sparse_matrix_train is not None:
+                    final_model = build_svm(kernel='linear', probability=False, random_state=RANDOM_STATE)
+                    print("  Training final Baseline SVM...")
+                    final_model.fit(tfidf_sparse_matrix_train, y_train_full)
+                    test_features = tfidf_sparse_matrix_test
+                else: print("  Cannot train final Baseline SVM: Missing TF-IDF features.")
+
+            elif strategy_name == 'Baseline (Semantic -> Dense NN)':
+                if 'semantic_vector' in df_train.columns:
+                    X_train_sem_raw = np.stack(df_train['semantic_vector'].values)
+                    X_test_sem_raw = np.stack(df_test['semantic_vector'].values)
+                    X_train_sem = scalers['sem'].transform(X_train_sem_raw)
+                    X_test_sem = scalers['sem'].transform(X_test_sem_raw)
+
+                    test_features = X_test_sem
+                    is_keras_final = True
+
+                    tf.random.set_seed(RANDOM_STATE)
+                    final_model = build_dense_for_semantic(input_dim=X_train_sem.shape[1])
+                    print("  Training final Baseline Dense NN...")
+                    final_model.fit(X_train_sem, y_train_full, epochs=EPOCHS, batch_size=BATCH_SIZE, verbose=0)
+                else: print("  Cannot train final Baseline NN: Missing Semantic features.")
+
+            # Evaluate the trained final model on the test set
+            if final_model is not None and test_features is not None:
+                print(f"  Evaluating final model on Test Set...")
+
+                if strategy_name == 'Late Fusion (Avg Prob)':
+                    model_svm, model_nn = final_model
+                    X_test_tfidf, X_test_sem_scaled = test_features
+                    _, _, _, _, svm_probs_test, _ = evaluate_model(model_svm, X_test_tfidf, y_test)
+                    _, _, _, _, nn_probs_test, _ = evaluate_model(model_nn, X_test_sem_scaled, y_test, is_keras=True)
+
+                    if svm_probs_test is not None and nn_probs_test is not None:
+                        avg_probs_test = (svm_probs_test + nn_probs_test) / 2
+                        y_pred_test = (avg_probs_test > 0.5).astype(int)
+                        acc_test = accuracy_score(y_test, y_pred_test)
+                        pre_test, rec_test, f1_test, _ = precision_recall_fscore_support(y_test, y_pred_test, average='binary', zero_division=0)
+                    else:
+                        print("  Evaluation failed due to missing probabilities.")
+                else:
+                    acc_test, pre_test, rec_test, f1_test, _, y_pred_test = evaluate_model(
+                        final_model, test_features, y_test, is_keras=is_keras_final
+                    )
+
+                print(f"  Test Set Metrics: Acc={acc_test:.4f}, P={pre_test:.4f}, R={rec_test:.4f}, F1={f1_test:.4f}")
+                # Optional: Print classification report for test set
+                # if y_pred_test is not None:
+                #     print("\n  Test Classification Report:")
+                #     print(classification_report(y_test, y_pred_test, target_names=[str(c) for c in label_classes], zero_division=0))
+
+                # Save the final model for this strategy
+                print(f"  Saving final model for {strategy_name}...")
+                model_paths = save_final_model(final_model, strategy_name, final_model_dir)
+                if model_paths:
+                    saved_model_paths[strategy_name] = model_paths
+
+            else:
+                print("  Could not train or evaluate the final model for this strategy.")
+
+        except Exception as e:
+            print(f"  ERROR during final training/evaluation for strategy '{strategy_name}': {e}")
+            if 'final_model' in locals() and hasattr(final_model, 'save'): # Check if Keras model exists
+                tf.keras.backend.clear_session() # Clear session if Keras model was involved in error
+
+        finally:
+            # Store test results (even if NaN)
+            all_test_results.append({
+                'strategy': strategy_name,
+                'test_accuracy': acc_test,
+                'test_precision': pre_test,
+                'test_recall': rec_test,
+                'test_f1_score': f1_test
+            })
+            # Clean up memory
+            if 'final_model' in locals(): del final_model
+            if 'test_features' in locals(): del test_features
+            gc.collect()
+
+
+    # 6. Save Test Set Results
+    if all_test_results:
+        test_results_df = pd.DataFrame(all_test_results)
+        print(f"\nSaving test set results for all strategies to: {test_output_file}")
+        test_results_df.to_csv(test_output_file, index=False)
+
+        # 7. Identify and Report Best Model based on Test Set F1
+        test_results_df = test_results_df.sort_values(by='test_f1_score', ascending=False).reset_index(drop=True)
+        print("\n--- Final Test Set Performance Summary (Sorted by F1-Score) ---")
+        print(test_results_df)
+
+        if not test_results_df.empty and not pd.isna(test_results_df.iloc[0]['test_f1_score']):
+            best_test_strategy = test_results_df.iloc[0]['strategy']
+            best_test_f1 = test_results_df.iloc[0]['test_f1_score']
+            print(f"\nOverall Best Strategy based on Test F1-Score: {best_test_strategy} (F1 = {best_test_f1:.4f})")
+            print(f"Model(s) saved in: {final_model_dir}")
+            if best_test_strategy in saved_model_paths:
+                print(f"Specific model file(s): {saved_model_paths[best_test_strategy]}")
+        else:
+            print("\nCould not determine the best strategy based on test results (results might be empty or NaN).")
+
+    else:
+        print("\nNo test results were generated.")
+
 
     print("\nPhase 4 Processing complete.")
-
-
-# ----- Previous Feature Fusion Functions -----
-# def early_fusion(df):
-#     features = ['tfidf_feature1', 'tfidf_feature2',
-#                 'word_count', 'pos_NOUN', 'semantic_vector']
-#     X = df[features]
-#     X_train, X_test, y_train, y_test = train_test_split(X, df['label'])
-#     model = SVC().fit(X_train, y_train)
-#     return f1_score(y_test, model.predict(X_test))
-#
-# def late_fusion(svm_probs, lstm_probs):
-#     avg_probs = (svm_probs + lstm_probs) / 2
-#     return (avg_probs > 0.5).astype(int)
-
-# # Example usage
-# # svm_model = SVC().fit(tfidf_features, labels)
-# # lstm_model = build_lstm().fit(semantic_features, labels)
-# #
-# # svm_probs = svm_model.predict_proba(tfidf_test)[:, 1]
-# # lstm_probs = lstm_model.predict(semantic_test)
-# # final_preds = late_fusion(svm_probs, lstm_probs)
-#
-# if __name__ == "__main__":
-#     data_dir = Path('data/processed')
-#     input_file = data_dir / 'phase2_output.csv'
-#     output_dir = Path('results')
-#
-#     # load features
-#     df = pd.read_csv(input_file)
-#     # separate features and labels
-#     features = ['tfidf_feature1', 'tfidf_feature2',
-#                 'word_count', 'pos_NOUN', 'semantic_vector']
-#     X = df[features]
-#     y = df['label']
-#     # Train-test split
-#     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-#     # Train SVM model
-#     svm_model = SVC(probability=True)
-#
-#     svm_model.fit(X_train, y_train)
-#     # Get probabilities
-#     svm_probs = svm_model.predict_proba(X_test)[:, 1]
-#     # Assuming lstm_model is defined and trained
-#     lstm_model = build_lstm().fit(semantic_features, labels)
-#
-#     # Example DataFrame
-#     data = {
-#         'tfidf_feature1': [0.1, 0.2, 0.3],
-#         'tfidf_feature2': [0.4, 0.5, 0.6],
-#         'word_count': [100, 150, 200],
-#         'pos_NOUN': [10, 15, 20],
-#         'semantic_vector': [[0.1]*384, [0.2]*384, [0.3]*384],
-#         'label': [0, 1, 0]
-#     }
-#     df = pd.DataFrame(data)
-#     print(early_fusion(df))
