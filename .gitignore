@@ -65,3 +65,4 @@ wheels/
 /models/
 /toxic_ngrams.html
 /data/processed/
+/results/
