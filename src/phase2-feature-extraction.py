@@ -6,12 +6,17 @@ import pandas as pd
 import numpy as np
 import spacy
 from nltk.sentiment import SentimentIntensityAnalyzer
+# from better_profanity import profanity
+from profanity_check import predict, predict_prob
 # from profanity_check import predict_prob  # Assuming this is used elsewhere or can be removed if not
 from sentence_transformers import SentenceTransformer
 from tqdm import tqdm
 from sklearn.model_selection import train_test_split
 # --- Global Setup ---
 # Load models only once
+
+# Patch for the profanity_check library to avoid reloading models
+# C:\Users\anils\Desktop\ubi\research\cyberbuling-emojis\source\cyberbullying\venv\lib\site-packages\profanity_check\profanity_check.py
 try:
     nlp = spacy.load('en_core_web_sm')
 except OSError:
@@ -68,7 +73,7 @@ def extract_features(row: pd.Series) -> pd.Series:
     # --- Lexical Features ---
     row['word_count'] = word_count
     row['unique_word_ratio'] = len(set(words)) / word_count if word_count > 0 else 0
-    # row['profanity_score'] = predict_prob([text])[0] # Uncomment if profanity_check is installed and needed
+    row['profanity_score'] = predict_prob([text])[0]
 
     # --- Syntactic Features (using spaCy) ---
     doc = nlp(text)
