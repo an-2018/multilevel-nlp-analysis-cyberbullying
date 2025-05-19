@@ -12,33 +12,42 @@ import pandas as pd
 import shap
 import lime
 import lime.lime_tabular
-import lime.lime_text # <-- Make sure this line is uncommented
+import lime.lime_text
 from scipy.sparse import load_npz
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.naive_bayes import ComplementNB
-from sklearn.preprocessing import StandardScaler, LabelEncoder # Added
+from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.svm import SVC, LinearSVC
 from tensorflow.keras.models import load_model
-# from tf_keras import Sequential # Assuming this might be a custom or older import, check if needed
 from tqdm import tqdm
 from xgboost import XGBClassifier
+import torch
+import torch.nn as nn
+from captum.attr import (
+    IntegratedGradients,
+    LayerIntegratedGradients,
+    LayerGradientShap,
+    Occlusion,
+    Saliency,
+    GuidedGradCam,
+    visualization
+)
 
 import tensorflow as tf
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2' # Reduce TensorFlow verbosity
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 TF_AVAILABLE = True
-
-# Configure SHAP for JS plots in notebooks (optional, can be removed if not using notebooks)
-# shap.initjs() # Comment out if not running in a notebook environment
 
 # --- Constants ---
 RANDOM_STATE = 42
-SEMANTIC_DIM = 384 # Default, will be updated in load_data if needed
-N_SHAP_SAMPLES = 100 # Number of samples for SHAP summary plot
-N_SHAP_BACKGROUND = 50 # Size of background dataset for SHAP Kernel/Deep explainer
-N_LIME_SAMPLES = 5   # Number of instances to explain with LIME
-N_LIME_FEATURES = 10 # Number of features to show in LIME explanations
-N_IG_SAMPLES = 50    # Number of samples for Integrated Gradients
+SEMANTIC_DIM = 384
+N_SHAP_SAMPLES = 10  # Reduced for speed
+N_SHAP_BACKGROUND = 10  # Reduced for speed
+N_SHAP_FEATURES = 100  # Limit SHAP to top 100 features by variance
+N_LIME_SAMPLES = 5
+N_LIME_FEATURES = 10
+N_IG_SAMPLES = 50
+N_CAPTUM_SAMPLES = 10  # Number of samples for Captum analysis
 
 # --- Utility Functions ---
 
@@ -246,9 +255,9 @@ class XAIAnalyzer:
         self.df, self.tfidf_sparse_matrix, self.feature_groups, self.tfidf_feature_names = load_data_for_xai(data_path, tfidf_sparse_path)
         self.models = self._load_models(model_paths)
         self.scalers = self._load_scalers(scaler_paths)
-        self.explanations = defaultdict(dict) # Use defaultdict
-
-        # Store feature names for different groups
+        self.explanations = defaultdict(dict)
+        
+        # Initialize feature names
         self.feature_names = {}
         self.feature_names['lexical'] = self.feature_groups.get('lexical', [])
         self.feature_names['syntactic'] = self.feature_groups.get('syntactic', [])
@@ -260,10 +269,192 @@ class XAIAnalyzer:
 
         # Combine dense features for easier access
         self.dense_feature_names = self.feature_names['lexical'] + \
-                                   self.feature_names['syntactic'] + \
-                                   self.feature_names['sentiment'] + \
-                                   self.feature_names['tfidf_dense']
+                                 self.feature_names['syntactic'] + \
+                                 self.feature_names['sentiment'] + \
+                                 self.feature_names['tfidf_dense']
+        
+        # Initialize Captum attributes
+        self.captum_attributors = {}
+        self._initialize_captum_attributors()
 
+    def _initialize_captum_attributors(self):
+        """Initialize Captum attributors for PyTorch models."""
+        for model_name, model in self.models.items():
+            if isinstance(model, nn.Module):
+                self.captum_attributors[model_name] = {
+                    'integrated_gradients': IntegratedGradients(model),
+                    'saliency': Saliency(model),
+                    'occlusion': Occlusion(model),
+                    'gradient_shap': LayerGradientShap(model, model.get_input_layer())
+                }
+
+    def analyze_sample_with_captum(self, model_name, sample_idx, feature_group_keys):
+        """Analyze a single sample using Captum attribution methods."""
+        if model_name not in self.captum_attributors:
+            print(f"Captum analysis not available for model {model_name}")
+            return
+
+        # Prepare sample data
+        sample_data = self._prepare_data_for_model(feature_group_keys, [sample_idx], scale=True)
+        if isinstance(sample_data, list):
+            sample_data = [torch.tensor(d, dtype=torch.float32) for d in sample_data]
+        else:
+            sample_data = torch.tensor(sample_data, dtype=torch.float32)
+
+        # Get model prediction
+        model = self.models[model_name]
+        model.eval()
+        with torch.no_grad():
+            prediction = model(sample_data)
+            pred_class = torch.argmax(prediction).item()
+
+        # Calculate attributions using different methods
+        attributions = {}
+        for method_name, attributor in self.captum_attributors[model_name].items():
+            if method_name == 'integrated_gradients':
+                attributions[method_name] = attributor.attribute(
+                    sample_data,
+                    target=pred_class,
+                    n_steps=50
+                )
+            elif method_name == 'saliency':
+                attributions[method_name] = attributor.attribute(
+                    sample_data,
+                    target=pred_class
+                )
+            elif method_name == 'occlusion':
+                attributions[method_name] = attributor.attribute(
+                    sample_data,
+                    target=pred_class,
+                    strides=(3,),
+                    sliding_window_shapes=(3,)
+                )
+
+        # Visualize attributions
+        self._visualize_captum_attributions(
+            model_name,
+            sample_idx,
+            attributions,
+            feature_group_keys
+        )
+
+    def _visualize_captum_attributions(self, model_name, sample_idx, attributions, feature_group_keys):
+        """Visualize Captum attributions for a sample."""
+        sample_text = self.df.iloc[sample_idx]['clean_text']
+        true_label = self.df.iloc[sample_idx]['label']
+        
+        # Create visualization directory
+        vis_dir = self.output_dir / 'captum_visualizations' / model_name
+        vis_dir.mkdir(parents=True, exist_ok=True)
+
+        # Plot attributions for each method
+        for method_name, attr in attributions.items():
+            plt.figure(figsize=(15, 5))
+            
+            # Convert attributions to numpy if they're tensors
+            if isinstance(attr, torch.Tensor):
+                attr = attr.detach().cpu().numpy()
+            
+            # Plot feature importance
+            feature_names = self._get_feature_names(feature_group_keys)
+            sorted_idx = np.argsort(np.abs(attr))
+            plt.barh(range(len(sorted_idx)), np.abs(attr[sorted_idx]))
+            plt.yticks(range(len(sorted_idx)), [feature_names[i] for i in sorted_idx])
+            plt.title(f'{method_name.capitalize()} Attribution for Sample: "{sample_text[:50]}..."')
+            plt.xlabel('Attribution Magnitude')
+            plt.tight_layout()
+            
+            # Save plot
+            plt.savefig(vis_dir / f'sample_{sample_idx}_{method_name}.png')
+            plt.close()
+
+    def analyze_linguistic_patterns(self, model_name, feature_group_keys, num_samples=5):
+        """Analyze linguistic patterns that contribute to classification."""
+        # Select diverse samples from each class
+        samples = self._select_diverse_samples(num_samples)
+        
+        for sample_idx in samples:
+            # Get sample text and true label
+            sample_text = self.df.iloc[sample_idx]['clean_text']
+            true_label = self.df.iloc[sample_idx]['label']
+            
+            # Perform LIME analysis
+            lime_exp = self.lime_analysis(
+                model_name,
+                feature_group_keys,
+                num_samples=1,
+                num_features=20,
+                sample_indices=[sample_idx]
+            )
+            
+            # Visualize linguistic patterns
+            self._visualize_linguistic_patterns(
+                model_name,
+                sample_idx,
+                sample_text,
+                true_label,
+                lime_exp
+            )
+
+    def _visualize_linguistic_patterns(self, model_name, sample_idx, text, true_label, lime_exp):
+        """Visualize linguistic patterns that contribute to classification."""
+        vis_dir = self.output_dir / 'linguistic_patterns' / model_name
+        vis_dir.mkdir(parents=True, exist_ok=True)
+
+        # Create a figure with multiple subplots
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(15, 10))
+        
+        # Plot 1: Word-level importance
+        words = text.split()
+        word_importance = [abs(exp[1]) for exp in lime_exp[0]]
+        ax1.bar(range(len(words)), word_importance)
+        ax1.set_xticks(range(len(words)))
+        ax1.set_xticklabels(words, rotation=45)
+        ax1.set_title(f'Word-level Importance for: "{text[:50]}..."')
+        ax1.set_ylabel('Importance Score')
+        
+        # Plot 2: Feature category importance
+        feature_categories = defaultdict(float)
+        for exp in lime_exp[0]:
+            feature_name = exp[0]
+            importance = abs(exp[1])
+            category = self._get_feature_category(feature_name)
+            feature_categories[category] += importance
+        
+        categories = list(feature_categories.keys())
+        values = list(feature_categories.values())
+        ax2.bar(categories, values)
+        ax2.set_title('Feature Category Importance')
+        ax2.set_ylabel('Cumulative Importance')
+        plt.xticks(rotation=45)
+        
+        plt.tight_layout()
+        plt.savefig(vis_dir / f'sample_{sample_idx}_linguistic_patterns.png')
+        plt.close()
+
+    def _get_feature_category(self, feature_name):
+        """Determine the category of a feature based on its name."""
+        if feature_name.startswith('pos_'):
+            return 'Syntactic'
+        elif feature_name.startswith('sentiment_'):
+            return 'Sentiment'
+        elif feature_name.startswith('tfidf_'):
+            return 'Lexical'
+        elif feature_name == 'semantic_vector':
+            return 'Semantic'
+        else:
+            return 'Other'
+
+    def _select_diverse_samples(self, num_samples):
+        """Select diverse samples from each class for analysis."""
+        samples = []
+        for label in self.df['label'].unique():
+            class_samples = self.df[self.df['label'] == label].index
+            if len(class_samples) > 0:
+                # Select samples with different lengths and characteristics
+                selected = np.random.choice(class_samples, min(num_samples, len(class_samples)), replace=False)
+                samples.extend(selected)
+        return samples
 
     def _load_models(self, model_paths):
         """Load trained models from different phases"""
@@ -545,60 +736,33 @@ class XAIAnalyzer:
             print("Cannot get prediction function. Skipping SHAP.")
             return
 
-        # Determine if the model inherently handles sparse data (like some sklearn models)
-        # or if it requires dense input (like NN models or RF/XGBoost).
-        model_module = type(model).__module__
-        is_tf_model = TF_AVAILABLE and ('tensorflow.python.keras' in model_module or 'keras.src.models' in model_module or isinstance(model, tf.keras.Model))
-        # is_pytorch_model = PYTORCH_AVAILABLE and ('torch.nn.modules' in model_module or isinstance(model, torch.nn.Module)) # If using PyTorch
-        is_tree_ensemble = isinstance(model, (RandomForestClassifier, XGBClassifier))
-        is_linear_sparse_friendly = isinstance(model, (LogisticRegression, LinearSVC, ComplementNB)) and 'tfidf_sparse' in feature_group_keys and len(feature_group_keys) == 1
-
-        # Decide if SHAP needs dense data based on model type and explainer choice
-        requires_dense_input_for_shap = is_tf_model or is_tree_ensemble # Deep/TreeExplainer need dense
-        # KernelExplainer *can* handle sparse but often works better/easier with dense, especially for background summarization.
-        # Let's default to dense for KernelExplainer unless explicitly dealing with a sparse-only linear model.
-        use_dense_for_kernel = not is_linear_sparse_friendly
-
-        # Prepare data
+        # Prepare data (full feature set)
         data, feature_names = self._prepare_data_for_model(
             feature_group_keys,
             scale=True, # Scaling is generally recommended for SHAP
-            return_dense_array=(requires_dense_input_for_shap or use_dense_for_kernel) # Convert to dense if needed by model/explainer
+            return_dense_array=True # Always use dense for SHAP
         )
         if data is None:
             print("Data preparation failed. Skipping SHAP.")
             return
 
-        is_sparse_data_for_explainer = hasattr(data, 'tocsr') and not (requires_dense_input_for_shap or use_dense_for_kernel)
-
-        # Sample data for explanation
         num_available_samples = data.shape[0]
-        if num_available_samples == 0:
-            print("Error: No data available after preparation. Skipping SHAP.")
-            return
         actual_sample_size = min(sample_size, num_available_samples)
         if actual_sample_size < sample_size:
             print(f"Warning: Requested sample size {sample_size} > available data {num_available_samples}. Using {actual_sample_size} samples.")
-
         sample_indices = np.random.choice(num_available_samples, actual_sample_size, replace=False)
         data_sample = data[sample_indices]
 
-        # Prepare background data
         actual_background_size = min(background_size, num_available_samples)
-        if actual_background_size < background_size:
-            print(f"Warning: Requested background size {background_size} > available data {num_available_samples}. Using {actual_background_size} samples.")
-
-        # Ensure background doesn't overlap significantly with sample for KernelExplainer
         available_indices_for_bg = np.setdiff1d(np.arange(num_available_samples), sample_indices)
         if len(available_indices_for_bg) >= actual_background_size:
             background_indices = np.random.choice(available_indices_for_bg, actual_background_size, replace=False)
-        elif num_available_samples > 0: # Fallback: use some data, even if overlapping
+        elif num_available_samples > 0:
             print("Warning: Not enough non-overlapping data for background. Using random sample which may include explained instances.")
             background_indices = np.random.choice(num_available_samples, actual_background_size, replace=False)
-        else: # Should not happen if data prep succeeded
+        else:
             print("Error: No data available for background set.")
             return
-
         background_data = data[background_indices]
 
         # --- Choose SHAP explainer ---
@@ -608,14 +772,14 @@ class XAIAnalyzer:
 
         try:
             # 1. TreeExplainer (for RF, XGBoost) - Handles dense/sparse automatically if model supports it
-            if isinstance(model, (RandomForestClassifier, XGBClassifier)) and not is_sparse_data_for_explainer: # TreeExplainer prefers dense
+            if isinstance(model, (RandomForestClassifier, XGBClassifier)) and not hasattr(data, 'tocsr'): # TreeExplainer prefers dense
                 print("  Using TreeExplainer.")
                 explainer = shap.TreeExplainer(model, data=background_data, feature_perturbation="interventional") # Use background for interventional
                 shap_values = explainer.shap_values(data_sample) # Check_additivity=False might be needed sometimes
                 expected_value = explainer.expected_value
 
             # 2. DeepExplainer (for TensorFlow/Keras)
-            elif is_tf_model:
+            elif TF_AVAILABLE and ('tensorflow.python.keras' in type(model).__module__ or 'keras.src.models' in type(model).__module__ or isinstance(model, tf.keras.Model)):
                 print("  Using DeepExplainer.")
                 # DeepExplainer expects tensors and dense data
                 try:
@@ -629,7 +793,7 @@ class XAIAnalyzer:
                     # Fallback will happen in the next 'if' block
 
             # 3. LinearExplainer (for Linear models, handles sparse)
-            elif isinstance(model, (LinearSVC, LogisticRegression, ComplementNB)) and not use_dense_for_kernel:
+            elif isinstance(model, (LinearSVC, LogisticRegression, ComplementNB)) and not hasattr(data, 'tocsr'):
                 print("  Using LinearExplainer.")
                 # LinearExplainer needs coefficients and potentially intercept
                 # It might require specific data format (dense or sparse) depending on implementation
@@ -665,7 +829,7 @@ class XAIAnalyzer:
 
                 # Summarize background data if it's large and dense
                 background_summary = background_data
-                if not is_sparse_data_for_explainer and background_data.shape[0] > N_SHAP_BACKGROUND * 2: # Heuristic
+                if not hasattr(data, 'tocsr') and background_data.shape[0] > N_SHAP_BACKGROUND * 2: # Heuristic
                     try:
                         print(f"  Summarizing background data using kmeans ({N_SHAP_BACKGROUND} centers)...")
                         background_summary = shap.kmeans(background_data, N_SHAP_BACKGROUND)
@@ -718,35 +882,53 @@ class XAIAnalyzer:
 
 
             # --- Visualization ---
-            plt.figure()
-            shap.summary_plot(shap_values_positive_class, data_sample, feature_names=feature_names, max_display=20, show=False)
-            plt.title(f'SHAP Summary Plot for {model_name} (Class 1)')
-            plt.tight_layout()
-            save_path = self.output_dir / f'shap_summary_{model_name}.png'
-            plt.savefig(save_path)
-            print(f"  Saved SHAP summary plot to {save_path}")
-            plt.close()
+            if shap_values_positive_class is not None:
+                # Select top N_SHAP_FEATURES for visualization
+                top_n = min(N_SHAP_FEATURES, len(feature_names))
+                mean_abs_shap = np.mean(np.abs(shap_values_positive_class), axis=0)
+                top_idx = np.argsort(mean_abs_shap)[-top_n:]
+                top_idx = top_idx.tolist()  # Ensure it's a list of ints
+                # Plot only top N_SHAP_FEATURES
+                plt.figure()
+                shap.summary_plot(
+                    shap_values_positive_class[:, top_idx],
+                    data_sample[:, top_idx],
+                    feature_names=[feature_names[i] for i in top_idx],
+                    max_display=top_n,
+                    show=False
+                )
+                plt.title(f'SHAP Summary Plot for {model_name} (Class 1, Top {top_n})')
+                plt.tight_layout()
+                save_path = self.output_dir / f'shap_summary_{model_name}.png'
+                plt.savefig(save_path)
+                print(f"  Saved SHAP summary plot to {save_path}")
+                plt.close()
 
-            # Example force plot for the first instance in the sample
-            if expected_value_positive_class is not None:
+                # Example force plot for the first instance in the sample (top N features)
                 try:
-                    # Create Explanation object for the first sample instance
-                    expl = shap.Explanation(values=shap_values_positive_class[0],
-                                            base_values=expected_value_positive_class,
-                                            data=data_sample[0],
-                                            feature_names=feature_names)
+                    expl = shap.Explanation(
+                        values=shap_values_positive_class[0, top_idx],
+                        base_values=expected_value_positive_class,
+                        data=data_sample[0, top_idx],
+                        feature_names=[feature_names[i] for i in top_idx]
+                    )
                     plt.figure()
-                    # Generate and save the force plot
-                    # Use shap.plots.force for more control if needed
-                    shap.force_plot(expl.base_values, expl.values, expl.data, feature_names=expl.feature_names, matplotlib=True, show=False)
-                    plt.title(f'SHAP Force Plot (Instance {sample_indices[0]}) for {model_name}')
+                    shap.force_plot(
+                        expl.base_values,
+                        expl.values,
+                        expl.data,
+                        feature_names=expl.feature_names,
+                        matplotlib=True,
+                        show=False
+                    )
+                    plt.title(f'SHAP Force Plot (Instance {sample_indices[0]}) for {model_name} (Top {top_n})')
                     save_path_force = self.output_dir / f'shap_force_instance{sample_indices[0]}_{model_name}.png'
                     plt.savefig(save_path_force, bbox_inches='tight')
                     print(f"  Saved SHAP force plot example to {save_path_force}")
                     plt.close()
                 except Exception as force_plot_err:
                     print(f"  Could not generate SHAP force plot: {force_plot_err}")
-                    plt.close('all') # Close any potentially open figures
+                    plt.close('all')
             else:
                 print("  Skipping force plot example as expected_value was not determined.")
 
@@ -1224,7 +1406,6 @@ class XAIAnalyzer:
             # else: # Optional: Warn about duplicates if needed
             #     print(f"    Debug: Duplicate feature name '{name}' encountered during aggregation.")
 
-
         assigned_value_sum = 0.0 # Keep track of assigned impact
 
         # Iterate through defined feature groups
@@ -1250,33 +1431,43 @@ class XAIAnalyzer:
             # Sum impacts for features belonging to this category
             for name in target_names:
                 if name in feature_value_map:
-                    category_total_impact += feature_value_map[name]
-                    assigned_value_sum += feature_value_map[name] # Add to total assigned
+                    val = feature_value_map[name]
+                    # Fix: Convert numpy array to float if needed
+                    if isinstance(val, np.ndarray):
+                        if val.ndim == 1 and val.shape[0] == 2:
+                            val = float(val[1])  # Use class 1
+                        elif val.size == 1:
+                            val = float(val.item())
+                        else:
+                            val = float(np.mean(val))
+                    category_total_impact += val
+                    assigned_value_sum += val # Add to total assigned
                     found_count += 1
                     # Remove the feature from the map to avoid double counting
                     # and to track unassigned features later
                     del feature_value_map[name]
 
             if found_count > 0:
-                impacts[category] = category_total_impact
+                # Fix: Convert numpy array to float if needed
+                if isinstance(category_total_impact, np.ndarray):
+                    category_total_impact = float(category_total_impact)
                 print(f"    Category '{category}': Found {found_count} features. Total Impact: {category_total_impact:.4f}")
+                impacts[category] = category_total_impact
             else:
-                # print(f"    Category '{category}': No matching features found in explanation data.")
                 impacts[category] = 0.0 # Ensure category exists in dict even if 0
 
         # Handle any remaining features in feature_value_map as 'unassigned'
-        unassigned_impact = sum(feature_value_map.values())
+        unassigned_impact = sum(float(v) if isinstance(v, np.ndarray) else v for v in feature_value_map.values())
         unassigned_count = len(feature_value_map)
         if unassigned_count > 0:
-            impacts['unassigned'] = unassigned_impact
             print(f"    Warning: {unassigned_count} features were not assigned to any category (e.g., {list(feature_value_map.keys())[:10]}...). Total Unassigned Impact: {unassigned_impact:.4f}")
+            impacts['unassigned'] = unassigned_impact
 
         # Sanity check: Total aggregated impact vs total original impact
-        total_original_impact = np.sum(values)
-        total_aggregated_impact = sum(impacts.values())
+        total_original_impact = float(np.sum(values))
+        total_aggregated_impact = float(sum(impacts.values()))
         if not np.isclose(total_original_impact, total_aggregated_impact):
             print(f"    Warning: Total aggregated impact ({total_aggregated_impact:.4f}) does not match total original impact ({total_original_impact:.4f}). Check for double counting or missed features.")
-
 
         return dict(impacts)
 
